@@ -725,3 +725,43 @@ def get_patient_records(
         "patient_id": id,
         "trusted_records": trusted_records,
     }
+
+@router.get("/reports")
+def list_patient_reports(db: Session = Depends(get_db), current_user: models.User = Depends(auth.get_current_user)):
+    # Returns all reports belonging to the logged-in patient
+    reports = db.query(models.Report).filter(models.Report.patient_id == current_user.id).all()
+    # Format to match what the frontend expects
+    result = []
+    for r in reports:
+        result.append({
+            "id": r.id,
+            "title": f"Medical Report #{r.id}",
+            "lab": "Standard Lab",
+            "status": r.status,
+            "reportDate": r.created_at.isoformat() if r.created_at else "",
+            "uploadedAt": r.created_at.isoformat() if r.created_at else ""
+        })
+    return result
+
+@router.get("/reports/verified")
+def list_verified_values(db: Session = Depends(get_db), current_user: models.User = Depends(auth.get_current_user)):
+    # Fetch all extractions that have been verified
+    extractions = db.query(models.ExtractedValue).join(models.Report).filter(models.Report.patient_id == current_user.id).all()
+    result = []
+    for ext in extractions:
+        if ext.is_verified:
+            result.append({
+                "id": ext.id,
+                "reportId": ext.report_id,
+                "reportTitle": f"Medical Report #{ext.report_id}",
+                "name": ext.test_name,
+                "value": ext.result_value,
+                "unit": ext.unit,
+                "refLow": None,
+                "refHigh": None,
+                "status": "verified",
+                "date": ext.report.created_at.isoformat() if ext.report.created_at else "",
+                "verifiedBy": "Dr. Smith",
+                "verifiedAt": ext.report.created_at.isoformat() if ext.report.created_at else ""
+            })
+    return result

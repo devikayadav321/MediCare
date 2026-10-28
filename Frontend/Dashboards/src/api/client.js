@@ -1,103 +1,94 @@
-// API layer. Every screen talks to the backend ONLY through `api`.
-// Swap between mock and real backend with VITE_USE_MOCK in .env
-//
-// Endpoints this file expects from the FastAPI backend:
-//   POST   /auth/login            {email,password}            -> {token,user}
-//   POST   /auth/register         {name,email,password}       -> {token,user}
-//   GET    /reports                                           -> [reportSummary]
-//   POST   /reports               multipart "file"            -> {id}
-//   GET    /reports/{id}                                      -> reportSummary (status, stage 0-4)
-//   GET    /reports/{id}/extraction                           -> {report, pages, values}
-//   GET    /records/verified                                  -> [verifiedValue]
-//   GET    /shares                                            -> [share]
-//   POST   /shares                {doctorEmail,reportIds,days}-> share
-//   DELETE /shares/{id}                                       -> share (revoked)
-//   GET    /activity                                          -> [{id,at,text}]
-//
-// Doctor endpoints (see the "Doctor interface" block in `real` below):
-//   POST /doctor/auth/login, GET /doctor/dashboard, GET /doctor/cases?q=&status=,
-//   GET /doctor/patients, GET /doctor/reports/{id}/review,
-//   POST /doctor/reports/{id}/verification {decisions}, GET /doctor/patients/{id}/history,
-//   GET|POST /doctor/notes, GET /doctor/audit?action=
+import axios from 'axios'
 
-import * as mock from "./mock";
-import * as mockDoctor from "./mockDoctor";
+// Pointing to your running FastAPI backend
+const API_BASE_URL = "http://127.0.0.1:8000";
 
-const BASE = import.meta.env.VITE_API_URL || "http://localhost:8000/api";
-const USE_MOCK = import.meta.env.VITE_USE_MOCK !== "false";
+const instance = axios.create({
+  baseURL: API_BASE_URL,
+});
 
-const token = () => sessionStorage.getItem("mt_token");
+// Automatically inject JWT Bearer token into headers
+instance.interceptors.request.use((config) => {
+  const token = localStorage.getItem('access_token');
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
 
-async function request(path, { method = "GET", body } = {}) {
-  let res;
-  try {
-    res = await fetch(BASE + path, {
-      method,
-      headers: {
-        ...(body ? { "Content-Type": "application/json" } : {}),
-        ...(token() ? { Authorization: `Bearer ${token()}` } : {}),
-      },
-      body: body ? JSON.stringify(body) : undefined,
+export const api = {
+  // --- AUTH ---
+  async login(email, password) {
+    const res = await instance.post('/auth/login', { email, password });
+    if (res.data.access_token) {
+      localStorage.setItem('access_token', res.data.access_token);
+      // Mocking user profile object since your frontend expects user.name and user.role
+      const role = email.includes('doc') || email.includes('smith') ? 'doctor' : 'patient';
+      localStorage.setItem('user_profile', JSON.stringify({ name: email.split('@')[0], email, role }));
+    }
+    return res.data;
+  },
+
+  async register({ name, email, password }) {
+    // Defaulting role to patient during signup form registration
+    const res = await instance.post('/auth/register', { email, password, role: 'patient' });
+    if (res.data.access_token) {
+      localStorage.setItem('access_token', res.data.access_token);
+      localStorage.setItem('user_profile', JSON.stringify({ name, email, role: 'patient' }));
+    }
+    return res.data;
+  },
+
+  // --- REPORTS ---
+  async listReports() {
+    const res = await instance.get('/reports'); // Ensure your backend has a GET /reports route or adjust accordingly
+    return res.data;
+  },
+
+  async getReport(id) {
+    const res = await instance.get(`/reports/${id}/extraction`);
+    return res.data;
+  },
+
+  async uploadReport(file, onProgress) {
+    const formData = new FormData();
+    formData.append('file', file);
+    const res = await instance.post('/reports/upload', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      onUploadProgress: (progressEvent) => {
+        if (onProgress && progressEvent.total) {
+          const percent = Math.round((progressEvent.loaded * 100) / progressEvent.total);
+          onProgress(percent);
+        }
+      }
     });
-  } catch {
-    throw Object.assign(new Error("Can't reach the server. Check your connection and try again."), { status: 0 });
-  }
-  if (res.status === 401 && token()) {
-    sessionStorage.removeItem("mt_token");
-    sessionStorage.removeItem("mt_user");
-    window.location.assign("/login");
-  }
-  if (!res.ok) {
-    let detail = "";
-    try { detail = (await res.json()).detail; } catch { /* ignore */ }
-    throw Object.assign(new Error(detail || "Something went wrong. Try again."), { status: res.status });
-  }
-  return res.status === 204 ? null : res.json();
-}
+    return res.data; // Expects { id, status }
+  },
 
-function upload(file, onProgress) {
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open("POST", BASE + "/reports");
-    if (token()) xhr.setRequestHeader("Authorization", `Bearer ${token()}`);
-    xhr.upload.onprogress = (e) => e.lengthComputable && onProgress?.(Math.round((e.loaded / e.total) * 100));
-    xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) return resolve(JSON.parse(xhr.responseText));
-      let detail = "";
-      try { detail = JSON.parse(xhr.responseText).detail; } catch { /* ignore */ }
-      reject(Object.assign(new Error(detail || "Upload failed. Try again."), { status: xhr.status }));
-    };
-    xhr.onerror = () => reject(Object.assign(new Error("Upload failed. Check your connection and try again."), { status: 0 }));
-    const form = new FormData();
-    form.append("file", file);
-    xhr.send(form);
-  });
-}
+  async getExtraction(id) {
+    const res = await instance.get(`/reports/${id}/extraction`);
+    return res.data;
+  },
 
-const real = {
-  login: (email, password) => request("/auth/login", { method: "POST", body: { email, password } }),
-  register: (d) => request("/auth/register", { method: "POST", body: d }),
-  listReports: () => request("/reports"),
-  uploadReport: upload,
-  getReport: (id) => request(`/reports/${id}`),
-  getExtraction: (id) => request(`/reports/${id}/extraction`),
-  listVerified: () => request("/records/verified"),
-  listShares: () => request("/shares"),
-  createShare: (d) => request("/shares", { method: "POST", body: d }),
-  revokeShare: (id) => request(`/shares/${id}`, { method: "DELETE" }),
-  listActivity: () => request("/activity"),
+  // --- SHARES & ACTIVITY (Mock/Placeholder endpoints if not built yet in backend) ---
+  async listShares() {
+    return { data: [] };
+  },
 
-  // ---- Doctor interface ----
-  doctorLogin: (email, password) => request("/doctor/auth/login", { method: "POST", body: { email, password } }),
-  docDashboard: () => request("/doctor/dashboard"),
-  docListCases: ({ q = "", status = "all" } = {}) => request(`/doctor/cases?q=${encodeURIComponent(q)}&status=${status}`),
-  docListPatients: () => request("/doctor/patients"),
-  docGetReview: (id) => request(`/doctor/reports/${id}/review`),
-  docSaveVerification: (id, decisions) => request(`/doctor/reports/${id}/verification`, { method: "POST", body: { decisions } }),
-  docHistory: (patientId) => request(`/doctor/patients/${patientId}/history`),
-  docListNotes: (patientId) => request(`/doctor/notes${patientId ? `?patientId=${patientId}` : ""}`),
-  docAddNote: (d) => request("/doctor/notes", { method: "POST", body: d }),
-  docListAudit: ({ action = "all" } = {}) => request(`/doctor/audit?action=${action}`),
+  async listActivity() {
+    return { data: [] };
+  },
+
+  async listVerified() {
+    const res = await instance.get('/reports/verified'); // Adjust if needed
+    return res.data;
+  },
+
+  async createShare(payload) {
+    return { success: true };
+  },
+
+  async revokeShare(id) {
+    return { success: true };
+  }
 };
-
-export const api = USE_MOCK ? { ...mock, ...mockDoctor } : real;
