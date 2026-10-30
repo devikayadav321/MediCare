@@ -6,6 +6,8 @@ from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 from database import get_db
 import models, schemas
+from typing import Optional
+from datetime import timedelta, datetime
 
 SECRET_KEY = "SUPER_SECRET_MEDICAL_KEY_CHANGE_IN_PRODUCTION"
 ALGORITHM = "HS256"
