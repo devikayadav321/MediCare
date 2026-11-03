@@ -21,7 +21,7 @@ export default function Dashboard() {
   const stats = {
     total: list.length,
     pending: list.filter((r) => r.status === "pending").length,
-    verified: list.filter((r) => r.status === "verified").length,
+    verified: list.filter((r) => r.status === "verified" || r.status === "reviewed").length,
     shares: (shares.data || []).filter((s) => s.status === "active").length,
   };
 
@@ -41,7 +41,7 @@ export default function Dashboard() {
           <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
             <Stat n={stats.total} label="Reports uploaded" />
             <Stat n={stats.pending} label="Pending Doctor Verification" />
-            <Stat n={stats.verified} label="Verified by doctor" />
+            <Stat n={stats.verified} label="Reviewed by doctor" />
             <Stat n={stats.shares} label="Active shares" />
           </div>
 

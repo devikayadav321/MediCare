@@ -32,7 +32,7 @@ export default function Evidence() {
   const shown = filter === "flagged" ? values.filter((v) => flagOf(v)) : values;
   const active = values.find((v) => v.id === selected);
   const page = pages.find((p) => p.page === active?.evidence.page) || pages[0];
-  const allVerified = report.status === "verified";
+  const allVerified = report.status === "verified" || report.status === "reviewed";
 
   return (
     <>
@@ -44,7 +44,7 @@ export default function Evidence() {
 
       <Notice tone={allVerified ? "verified" : "pending"}>
         {allVerified
-          ? <>Verified by <strong>{report.verifiedBy}</strong> on {fmtDate(report.verifiedAt)}. {SHORT_DISCLAIMER}</>
+          ? <>{report.status === "reviewed" ? "Reviewed" : "Verified"} by <strong>{report.reviewedBy || report.verifiedBy || "your doctor"}</strong>{(report.reviewedAt || report.verifiedAt) ? <> on {fmtDate(report.reviewedAt || report.verifiedAt)}</> : null}. {SHORT_DISCLAIMER}</>
           : DISCLAIMER}
       </Notice>
 

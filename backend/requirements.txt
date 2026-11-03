@@ -1,11 +1,13 @@
-fastapi==0.110.0
-uvicorn==0.28.0
-sqlalchemy==2.0.28
-pydantic==2.6.4
-pydantic[email]==2.6.4
-passlib[bcrypt]==1.7.4
-python-jose[cryptography]==3.3.0
-python-multipart==0.0.9
-
-# pip install fastapi uvicorn sqlalchemy python-multipart python-dotenv openai pypdf pillow pytesseract
+fastapi>=0.118.3,<1.0
+uvicorn[standard]>=0.34,<1.0
+sqlalchemy>=2.0.44,<3.0
+pydantic>=2.12,<3.0
+python-jose[cryptography]>=3.3,<4.0
+python-multipart>=0.0.20
+bcrypt>=4.0,<6.0
+openai>=1.30,<3.0
+python-dotenv>=1.0
+pypdf>=5.0
+Pillow>=11.0
+pytesseract>=0.3.10
 

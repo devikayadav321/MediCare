@@ -1,38 +1,45 @@
-# MediTrace - Patient Frontend
+# MediTrace backend
 
-React + Vite + Tailwind + Recharts + React Router.
+## Run locally (Windows PowerShell)
 
-## Run
-    npm install
-    cp .env.example .env
-    npm run dev
+From `C:\python\medi-trace\backend`:
 
-## Mock vs real backend
-- `VITE_USE_MOCK=true` (default): works with built-in sample data. Any email/password signs in.
-- Set `VITE_USE_MOCK=false` and `VITE_API_URL` to use the FastAPI backend.
-- All calls go through `src/api/client.js` (endpoint list is at the top of that file).
+```powershell
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+Copy-Item .env.example .env
+```
 
-## Safe wording
-All status text is in `src/constants/wording.js`. AI output is always labelled
-"Pending Doctor Verification" until a doctor verifies it. Never add "diagnosis" wording.
+Set `OPENROUTER_API_KEY` in `.env` to enable AI summaries and lab extraction. The app still accepts and stores reports without this key; analysis then returns a clear fallback summary and no fabricated values. Image OCR also requires the Tesseract OCR executable installed on Windows and available on `PATH`.
 
-## Screens
-Login, Onboarding (/welcome), Dashboard, Upload, Processing, Evidence (/reports/:id),
-Verified health information, Previous records (with trends), Secure sharing.
+Create a doctor account once, using hidden password input:
 
-## Doctor interface
-Sign in at `/doctor/login` (any email and password in mock mode).
-Screens: Doctor Dashboard (`/doctor`), Patient Cases (`/doctor/cases`),
-Report Review (`/doctor/reports/:id`), Historical Records (`/doctor/history`),
-Clinical Notes (`/doctor/notes`), Audit History (`/doctor/audit`).
+```powershell
+python create_doctor.py
+```
 
-Files: `src/pages/doctor/`, `src/components/doctor/`, `src/api/mockDoctor.js`.
-Doctor endpoints are listed in `src/api/client.js`.
-Patients and doctors are separated by `user.role` (`patient` or `doctor`).
+Start FastAPI from this folder so SQLite uses the existing `medical_platform.db`:
 
-## Connected demo (patient <-> doctor)
-- Patient and doctor screens share one data store (`src/api/store.js`, kept in localStorage key `mt_store_v1`).
-- A doctor sees a report only while an active, unexpired, unrevoked patient share covers it.
-- Login is per browser tab (sessionStorage), so the patient and the doctor can be signed in side by side.
-- Reset demo data from the browser console: `localStorage.removeItem("mt_store_v1")`.
-- Demo doctor email with pre-shared reports: `dr.chen@meditrace.health`.
+```powershell
+uvicorn main:app --reload
+```
+
+Start the frontend in a second terminal from `C:\python\medi-trace\Frontend\Dashboards`:
+
+```powershell
+npm install
+npm run dev
+```
+
+Open the Vite URL (usually `http://localhost:5173`). The Vite `/api` proxy forwards requests to FastAPI at `http://127.0.0.1:8000`.
+
+For a cross-origin deployment, set `VITE_API_BASE_URL` to the full FastAPI URL and set `FRONTEND_ORIGINS` in the backend `.env` to the frontend origin(s), comma-separated.
+
+## Existing database and migrations
+
+On startup, `migrations.run_migrations()` preserves existing rows, creates the `report_shares`, `audit_events`, and `schema_migrations` tables, and adds `users.full_name` plus nullable `reports.reviewed_by_id` and `reports.verified_at` columns when they are missing. The migration is idempotent and does not require deleting or reseeding `medical_platform.db`. Take a file backup before the first startup with this version.
+
+New patients can register from the UI. Doctor registration is intentionally disabled; provision each doctor with `python create_doctor.py`. Doctors see only reports the patient shared with their account. Shares expire and can be revoked by the patient.
+
+The OpenAPI page is available at `http://127.0.0.1:8000/docs`.

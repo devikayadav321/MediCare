@@ -4,6 +4,7 @@ import json
 import re 
 import uuid
 import logging
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +17,9 @@ from fastapi import (
     UploadFile,
     status,
 )
+from pydantic import BaseModel, Field, field_validator
 from openai import OpenAI
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 import auth
@@ -37,6 +40,22 @@ router = APIRouter(
     prefix="",
     tags=["Reports & Records"],
 )
+
+class ClinicalNotePayload(BaseModel):
+    notes: str
+
+class ShareRequest(BaseModel):
+    doctor_email: str
+    report_ids: list[int] = Field(min_length=1)
+    days: int = Field(ge=1, le=90)
+
+    @field_validator("doctor_email")
+    @classmethod
+    def validate_doctor_email(cls, value):
+        value = value.strip().lower()
+        if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", value):
+            raise ValueError("Enter a valid doctor's email address.")
+        return value
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
@@ -68,8 +87,8 @@ if OPENROUTER_API_KEY:
     client = OpenAI(
         base_url="https://openrouter.ai/api/v1",
         api_key=OPENROUTER_API_KEY,
-        timeout=60.0,
-        max_retries=1,
+        timeout=45.0,
+        max_retries=0,
     )
 
 
@@ -101,19 +120,29 @@ def get_report_or_404(report_id: int, db: Session):
     return report
 
 
-def check_report_access(report, user):
+def check_report_access(report, user, db: Session):
     is_owner = (
         user.role == models.RoleEnum.PATIENT
         and report.patient_id == user.id
     )
 
-    is_doctor = user.role == models.RoleEnum.DOCTOR
+    is_doctor = False
+    if user.role == models.RoleEnum.DOCTOR:
+        is_doctor = db.query(models.ReportShare.id).filter(
+            models.ReportShare.report_id == report.id,
+            models.ReportShare.doctor_id == user.id,
+            models.ReportShare.revoked_at.is_(None),
+            models.ReportShare.expires_at > datetime.utcnow(),
+        ).first() is not None
 
     if not (is_owner or is_doctor):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied to this medical report.",
         )
+
+def add_audit(db: Session, report: models.Report, actor: models.User, action: str, details: str):
+    db.add(models.AuditEvent(report_id=report.id, actor_id=actor.id, action=action, details=details))
 
 
 # =========================================================
@@ -417,6 +446,8 @@ def upload_report(
         )
 
         db.add(report)
+        db.flush()
+        add_audit(db, report, current_user, "uploaded", "Patient uploaded a medical report")
         db.commit()
         db.refresh(report)
 
@@ -445,101 +476,34 @@ def upload_report(
 
 @router.post("/reports/{id}/process")
 def process_report(id: int, db: Session = Depends(get_db), current_user: models.User = Depends(auth.get_current_user)):
-    report = db.query(models.Report).filter(models.Report.id == id).first()
-    if not report:
-        raise HTTPException(status_code=404, detail="Report not found")
-    
-    # 1. Read the uploaded file contents
-    file_text = "No text found."
+    report = get_report_or_404(id, db)
+    check_report_access(report, current_user, db)
+    if report.status != "uploaded":
+        raise HTTPException(status_code=409, detail="Only newly uploaded reports can be processed.")
     try:
-        if os.path.exists(report.file_path):
-            with open(report.file_path, "r", encoding="utf-8", errors="ignore") as f:
-                file_text = f.read()
-    except Exception as e:
-        file_text = f"File read error: {str(e)}"
-
-    # 2. Craft a prompt demanding strict JSON structure for lab values + a clinical summary
-    prompt = f"""
-    You are an expert AI medical assistant. Analyze the following medical report text.
-    You MUST return your response in valid JSON format with two keys:
-    1. "ai_summary": A string containing a clear clinical summary of the report.
-    2. "extractions": A list of extracted lab tests. Each item in the list must have these exact keys:
-       - "test_name" (string)
-       - "result_value" (string, e.g., "11.2")
-       - "unit" (string, e.g., "g/dL")
-       - "reference_range" (string, e.g., "13.5 - 17.5")
-       - "is_out_of_range" (boolean: true or false)
-       - "evidence_snippet" (string, the exact sentence or line from the report)
-
-    Report Content:
-    {file_text}
-
-    Return ONLY valid JSON. Do not include any extra conversational text outside the JSON block.
-    """
-
-    try:
-        response = client.chat.completions.create(
-            model="nvidia/nemotron-3-ultra-550b-a55b:free", # Free high-performance model on OpenRouter
-            messages=[
-                {"role": "system", "content": "You are a medical data extraction engine that outputs strictly in JSON."},
-                {"role": "user", "content": prompt}
-            ],
-            extra_headers={
-                "HTTP-Referer": "http://localhost:8000",
-                "X-Title": "MediTrace AI Platform",
-            }
-        )
-        ai_raw_output = response.choices[0].message.content
-        
-        # Clean up potential markdown formatting from LLM output (e.g. ```json ... ```)
-        cleaned_output = re.sub(r"^```json\s*|\s*```$", "", ai_raw_output.strip(), flags=re.IGNORECASE)
-        
-        parsed_data = json.loads(cleaned_output)
-        ai_summary = parsed_data.get("ai_summary", "Summary generated successfully.")
-        extracted_items = parsed_data.get("extractions", [])
-
-    except Exception as e:
-        # Fallback if JSON parsing fails so the app never crashes during a demo
-        ai_summary = f"AI Summary: Report analyzed. Note on parsing: {str(e)}"
-        extracted_items = [
-            {
-                "test_name": "General Finding",
-                "result_value": "Reviewed",
-                "unit": "N/A",
-                "reference_range": "Normal",
-                "is_out_of_range": False,
-                "evidence_snippet": file_text[:100]
-            }
-        ]
-
-    # 3. Save AI summary to report
-    report.ai_summary = ai_summary
-    report.status = "processed"
-
-    # 4. Clear any old extractions if re-processing, then save the newly extracted ones dynamically
-    db.query(models.ExtractedValue).filter(models.ExtractedValue.report_id == report.id).delete()
-    
-    for item in extracted_items:
-        ext = models.ExtractedValue(
-            report_id=report.id,
-            test_name=item.get("test_name", "Unknown Test"),
-            result_value=str(item.get("result_value", "")),
-            unit=item.get("unit", ""),
-            reference_range=item.get("reference_range", "N/A"),
-            is_out_of_range=bool(item.get("is_out_of_range", False)),
-            evidence_snippet=item.get("evidence_snippet", "")
-        )
-        db.add(ext)
-
-    db.commit()
-    
-    return {
-        "message": "Report dynamically processed using OpenRouter AI", 
-        "report_id": report.id, 
-        "ai_summary": report.ai_summary,
-        "extracted_values_count": len(extracted_items),
-        "status": report.status
-    }
+        file_text = extract_file_text(Path(report.file_path))
+        try:
+            analysis = analyze_report(file_text)
+            summary = analysis["summary"]
+            extracted_items = analysis["lab_values"]
+        except Exception:
+            logger.exception("AI analysis unavailable for report %s", id)
+            summary = "Automated analysis is temporarily unavailable. The original report is retained for doctor review. No values were inferred."
+            extracted_items = []
+        db.query(models.ExtractedValue).filter(models.ExtractedValue.report_id == report.id).delete()
+        report.ai_summary = summary
+        report.status = "processed"
+        for item in extracted_items:
+            db.add(models.ExtractedValue(report_id=report.id, test_name=item["test_name"], result_value=item["result_value"], unit=item["unit"], reference_range=item["reference_range"], is_out_of_range=bool(item["is_out_of_range"]), evidence_snippet=item["evidence_snippet"]))
+        db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as exc:
+        db.rollback()
+        logger.exception("Report processing failed for report %s", id)
+        raise HTTPException(status_code=422, detail="The uploaded report could not be read. Please upload a readable PDF, image, or text report.") from exc
+    return {"report_id": report.id, "ai_summary": report.ai_summary, "extracted_values_count": len(extracted_items), "status": report.status}
 
 
 # =========================================================
@@ -554,7 +518,7 @@ def get_report_extraction(
     current_user: models.User = Depends(auth.get_current_user),
 ):
     report = get_report_or_404(id, db)
-    check_report_access(report, current_user)
+    check_report_access(report, current_user, db)
 
     extractions = (
         db.query(models.ExtractedValue)
@@ -564,8 +528,16 @@ def get_report_extraction(
 
     return {
         "report_id": report.id,
+        "patient_id": report.patient_id,
+        "patient_name": report.patient.full_name,
+        "title": f"Medical Report #{report.id}",
+        "lab": "Uploaded report",
+        "reportDate": report.created_at.isoformat() if report.created_at else "",
+        "uploadedAt": report.created_at.isoformat() if report.created_at else "",
         "ai_summary": report.ai_summary,
         "status": report.status,
+        "reviewedBy": report.reviewer.email if report.reviewer else None,
+        "reviewedAt": report.verified_at.isoformat() if report.verified_at else None,
         "extractions": [
             {
                 "id": item.id,
@@ -581,6 +553,15 @@ def get_report_extraction(
             for item in extractions
         ],
     }
+
+@router.get("/reports/{id}/file")
+def get_report_file(id: int, db: Session = Depends(get_db), current_user: models.User = Depends(auth.get_current_user)):
+    report = get_report_or_404(id, db)
+    check_report_access(report, current_user, db)
+    path = Path(report.file_path)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Original report file is unavailable.")
+    return FileResponse(path, filename=f"medical-report-{report.id}{path.suffix.lower()}")
 
 
 # =========================================================
@@ -598,6 +579,7 @@ def verify_report(
     require_role(current_user, models.RoleEnum.DOCTOR)
 
     report = get_report_or_404(id, db)
+    check_report_access(report, current_user, db)
 
     if report.status != "processed":
         raise HTTPException(
@@ -606,6 +588,7 @@ def verify_report(
         )
 
     try:
+        found_ids = set()
         for verification in payload.verifications:
             extraction = (
                 db.query(models.ExtractedValue)
@@ -622,12 +605,31 @@ def verify_report(
                     detail="An extraction ID is invalid for this report.",
                 )
 
+            found_ids.add(extraction.id)
+            old_verified = extraction.is_verified
+            old_corrected = extraction.corrected_value
+
             extraction.is_verified = verification.is_verified
 
             if verification.corrected_value is not None:
                 extraction.corrected_value = (
                     verification.corrected_value
                 )
+            if verification.is_verified and verification.corrected_value is not None:
+                action = "corrected"
+                details = f"Corrected {extraction.test_name} to {verification.corrected_value} {extraction.unit or ''}".strip()
+            elif verification.is_verified:
+                action = "verified"
+                details = f"Verified {extraction.test_name}"
+            else:
+                action = "rejected"
+                details = f"Rejected {extraction.test_name}"
+            if old_verified != extraction.is_verified or old_corrected != extraction.corrected_value:
+                add_audit(db, report, current_user, action, details)
+
+        expected_ids = {item.id for item in report.extractions}
+        if found_ids != expected_ids or len(found_ids) != len(payload.verifications):
+            raise HTTPException(status_code=400, detail="Submit a decision for every extracted value in this report.")
 
         if payload.clinical_notes:
             note = report.clinical_note
@@ -644,7 +646,11 @@ def verify_report(
                     )
                 )
 
-        report.status = "verified"
+        was_rejected = any(not item.is_verified for item in report.extractions)
+        report.status = "reviewed" if was_rejected else "verified"
+        report.reviewed_by_id = current_user.id
+        report.verified_at = datetime.utcnow()
+        add_audit(db, report, current_user, "status_change", f"Report review completed: {report.status}")
         db.commit()
 
     except Exception:
@@ -656,6 +662,39 @@ def verify_report(
         "report_id": report.id,
         "status": report.status,
     }
+
+@router.post("/reports/{id}/notes")
+def add_clinical_note(id: int, payload: ClinicalNotePayload, db: Session = Depends(get_db), current_user: models.User = Depends(auth.get_current_user)):
+    require_role(current_user, models.RoleEnum.DOCTOR)
+    report = get_report_or_404(id, db)
+    check_report_access(report, current_user, db)
+    if not payload.notes.strip():
+        raise HTTPException(status_code=422, detail="Clinical note cannot be empty.")
+    note = report.clinical_note
+    if note:
+        note.notes = payload.notes.strip()
+        note.doctor_id = current_user.id
+    else:
+        note = models.ClinicalNote(report_id=id, doctor_id=current_user.id, notes=payload.notes.strip())
+        db.add(note)
+    add_audit(db, report, current_user, "note_added", "Clinical note saved")
+    db.commit()
+    db.refresh(note)
+    return {"id": note.id, "report_id": note.report_id, "notes": note.notes, "created_at": note.created_at.isoformat() if note.created_at else ""}
+
+@router.get("/doctor/notes")
+def list_clinical_notes(patient_id: int | None = None, db: Session = Depends(get_db), current_user: models.User = Depends(auth.get_current_user)):
+    require_role(current_user, models.RoleEnum.DOCTOR)
+    query = db.query(models.ClinicalNote).join(models.Report)
+    accessible_report_ids = db.query(models.ReportShare.report_id).filter(
+        models.ReportShare.doctor_id == current_user.id,
+        models.ReportShare.revoked_at.is_(None),
+        models.ReportShare.expires_at > datetime.utcnow(),
+    )
+    query = query.filter(models.ClinicalNote.report_id.in_(accessible_report_ids))
+    if patient_id is not None:
+        query = query.filter(models.Report.patient_id == patient_id)
+    return [{"id": n.id, "patientId": n.report.patient_id, "patientName": f"Patient #{n.report.patient_id}", "reportId": n.report_id, "reportTitle": f"Medical Report #{n.report_id}", "at": n.created_at.isoformat() if n.created_at else "", "author": n.doctor.email, "text": n.notes} for n in query.order_by(models.ClinicalNote.created_at.desc()).all()]
 
 
 # =========================================================
@@ -689,6 +728,18 @@ def get_patient_records(
         .all()
     )
 
+    if is_doctor:
+        shared_rows = db.query(models.ReportShare.report_id).filter(
+            models.ReportShare.doctor_id == current_user.id,
+            models.ReportShare.patient_id == id,
+            models.ReportShare.revoked_at.is_(None),
+            models.ReportShare.expires_at > datetime.utcnow(),
+        ).all()
+        shared_ids = {row[0] for row in shared_rows}
+        reports = [report for report in reports if report.id in shared_ids]
+        if not reports:
+            raise HTTPException(status_code=403, detail="This patient's records have not been shared with you.")
+
     trusted_records = []
 
     for report in reports:
@@ -708,6 +759,7 @@ def get_patient_records(
                 ),
                 "unit": item.unit,
                 "reference_range": item.reference_range,
+                "corrected_value": item.corrected_value,
                 "is_verified": item.is_verified,
             })
 
@@ -717,6 +769,8 @@ def get_patient_records(
             "report_id": report.id,
             "upload_date": report.created_at,
             "status": report.status,
+            "verified_by": report.reviewer.email if report.reviewer else None,
+            "verified_at": report.verified_at,
             "verified_values": verified_values,
             "clinical_note": note.notes if note else None,
         })
@@ -728,8 +782,17 @@ def get_patient_records(
 
 @router.get("/reports")
 def list_patient_reports(db: Session = Depends(get_db), current_user: models.User = Depends(auth.get_current_user)):
-    # Returns all reports belonging to the logged-in patient
-    reports = db.query(models.Report).filter(models.Report.patient_id == current_user.id).all()
+    query = db.query(models.Report)
+    if current_user.role == models.RoleEnum.PATIENT:
+        query = query.filter(models.Report.patient_id == current_user.id)
+    elif current_user.role == models.RoleEnum.DOCTOR:
+        shared_ids = db.query(models.ReportShare.report_id).filter(
+            models.ReportShare.doctor_id == current_user.id,
+            models.ReportShare.revoked_at.is_(None),
+            models.ReportShare.expires_at > datetime.utcnow(),
+        )
+        query = query.filter(models.Report.id.in_(shared_ids))
+    reports = query.order_by(models.Report.created_at.desc()).all()
     # Format to match what the frontend expects
     result = []
     for r in reports:
@@ -739,12 +802,19 @@ def list_patient_reports(db: Session = Depends(get_db), current_user: models.Use
             "lab": "Standard Lab",
             "status": r.status,
             "reportDate": r.created_at.isoformat() if r.created_at else "",
-            "uploadedAt": r.created_at.isoformat() if r.created_at else ""
+            "uploadedAt": r.created_at.isoformat() if r.created_at else "",
+            "patient_id": r.patient_id,
+            "patient_name": r.patient.full_name,
+            "ai_summary": r.ai_summary,
+            "valueCount": len(r.extractions),
+            "reviewedBy": r.reviewer.email if r.reviewer else None,
+            "reviewedAt": r.verified_at.isoformat() if r.verified_at else None
         })
     return result
 
 @router.get("/reports/verified")
 def list_verified_values(db: Session = Depends(get_db), current_user: models.User = Depends(auth.get_current_user)):
+    require_role(current_user, models.RoleEnum.PATIENT)
     # Fetch all extractions that have been verified
     extractions = db.query(models.ExtractedValue).join(models.Report).filter(models.Report.patient_id == current_user.id).all()
     result = []
@@ -755,13 +825,92 @@ def list_verified_values(db: Session = Depends(get_db), current_user: models.Use
                 "reportId": ext.report_id,
                 "reportTitle": f"Medical Report #{ext.report_id}",
                 "name": ext.test_name,
-                "value": ext.result_value,
+                "value": ext.corrected_value if ext.corrected_value is not None else ext.result_value,
+                "verifiedValue": ext.corrected_value,
                 "unit": ext.unit,
+                "referenceRange": ext.reference_range,
                 "refLow": None,
                 "refHigh": None,
-                "status": "verified",
+                "status": "corrected" if ext.corrected_value is not None else "verified",
                 "date": ext.report.created_at.isoformat() if ext.report.created_at else "",
-                "verifiedBy": "Dr. Smith",
-                "verifiedAt": ext.report.created_at.isoformat() if ext.report.created_at else ""
+                "verifiedAt": ext.report.verified_at.isoformat() if ext.report.verified_at else "",
+                "verifiedBy": ext.report.reviewer.email if ext.report.reviewer else "Doctor"
             })
     return result
+
+@router.get("/reports/{id:int}")
+def get_report_status(id: int, db: Session = Depends(get_db), current_user: models.User = Depends(auth.get_current_user)):
+    report = get_report_or_404(id, db)
+    check_report_access(report, current_user, db)
+    return {"id": report.id, "patient_id": report.patient_id, "patient_name": report.patient.full_name, "title": f"Medical Report #{report.id}", "lab": "Uploaded report", "status": report.status, "reportDate": report.created_at.isoformat() if report.created_at else "", "uploadedAt": report.created_at.isoformat() if report.created_at else "", "ai_summary": report.ai_summary, "reviewedBy": report.reviewer.email if report.reviewer else None, "reviewedAt": report.verified_at.isoformat() if report.verified_at else None, "stage": 3 if report.status in {"processed", "verified", "reviewed"} else 1}
+
+@router.post("/reports/shares")
+def create_report_shares(payload: ShareRequest, db: Session = Depends(get_db), current_user: models.User = Depends(auth.get_current_user)):
+    require_role(current_user, models.RoleEnum.PATIENT)
+    doctor = db.query(models.User).filter(models.User.email == str(payload.doctor_email).lower()).first()
+    if not doctor or doctor.role != models.RoleEnum.DOCTOR:
+        raise HTTPException(status_code=404, detail="No doctor account uses that email address.")
+    reports = db.query(models.Report).filter(
+        models.Report.id.in_(set(payload.report_ids)),
+        models.Report.patient_id == current_user.id,
+    ).all()
+    if len(reports) != len(set(payload.report_ids)):
+        raise HTTPException(status_code=404, detail="One or more selected reports were not found.")
+    if any(report.status not in {"processed", "verified", "reviewed"} for report in reports):
+        raise HTTPException(status_code=409, detail="Only processed reports can be shared.")
+    batch_id = uuid.uuid4().hex
+    expires_at = datetime.utcnow() + timedelta(days=payload.days)
+    try:
+        for report in reports:
+            db.add(models.ReportShare(batch_id=batch_id, report_id=report.id, patient_id=current_user.id, doctor_id=doctor.id, expires_at=expires_at))
+            add_audit(db, report, current_user, "shared", f"Report shared with {doctor.email}")
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return {"id": batch_id, "doctorEmail": doctor.email, "reportIds": [r.id for r in reports], "status": "active", "createdAt": datetime.utcnow().isoformat(), "expiresAt": expires_at.isoformat()}
+
+@router.get("/reports/shares")
+def list_report_shares(db: Session = Depends(get_db), current_user: models.User = Depends(auth.get_current_user)):
+    require_role(current_user, models.RoleEnum.PATIENT)
+    grants = db.query(models.ReportShare).filter(models.ReportShare.patient_id == current_user.id).order_by(models.ReportShare.created_at.desc()).all()
+    grouped = {}
+    now = datetime.utcnow()
+    for grant in grants:
+        item = grouped.setdefault(grant.batch_id, {"id": grant.batch_id, "doctorEmail": grant.doctor.email, "reportIds": [], "status": "active", "createdAt": grant.created_at.isoformat(), "expiresAt": grant.expires_at.isoformat()})
+        item["reportIds"].append(grant.report_id)
+        if grant.revoked_at:
+            item["status"] = "revoked"
+        elif grant.expires_at <= now and item["status"] == "active":
+            item["status"] = "expired"
+    return list(grouped.values())
+
+@router.delete("/reports/shares/{share_id}")
+def revoke_report_share(share_id: str, db: Session = Depends(get_db), current_user: models.User = Depends(auth.get_current_user)):
+    require_role(current_user, models.RoleEnum.PATIENT)
+    grants = db.query(models.ReportShare).filter(models.ReportShare.batch_id == share_id, models.ReportShare.patient_id == current_user.id).all()
+    if not grants:
+        raise HTTPException(status_code=404, detail="Share not found.")
+    now = datetime.utcnow()
+    for grant in grants:
+        if grant.revoked_at is None:
+            grant.revoked_at = now
+            add_audit(db, grant.report, current_user, "share_revoked", f"Sharing stopped with {grant.doctor.email}")
+    db.commit()
+    return {"id": share_id, "status": "revoked"}
+
+@router.get("/activity")
+def list_patient_activity(db: Session = Depends(get_db), current_user: models.User = Depends(auth.get_current_user)):
+    require_role(current_user, models.RoleEnum.PATIENT)
+    events = db.query(models.AuditEvent).join(models.Report).filter(models.Report.patient_id == current_user.id).order_by(models.AuditEvent.created_at.desc()).limit(50).all()
+    return [{"id": e.id, "at": e.created_at.isoformat(), "text": e.details, "reportId": e.report_id} for e in events]
+
+@router.get("/doctor/audit")
+def list_doctor_audit(action: str = "all", db: Session = Depends(get_db), current_user: models.User = Depends(auth.get_current_user)):
+    require_role(current_user, models.RoleEnum.DOCTOR)
+    shared_ids = db.query(models.ReportShare.report_id).filter(models.ReportShare.doctor_id == current_user.id, models.ReportShare.revoked_at.is_(None), models.ReportShare.expires_at > datetime.utcnow())
+    query = db.query(models.AuditEvent).filter(models.AuditEvent.report_id.in_(shared_ids))
+    if action != "all":
+        query = query.filter(models.AuditEvent.action == action)
+    events = query.order_by(models.AuditEvent.created_at.desc()).limit(200).all()
+    return [{"id": e.id, "at": e.created_at.isoformat(), "actor": e.actor.email, "action": e.action, "text": e.details, "reportId": e.report_id, "patientName": f"Patient #{e.report.patient_id}", "reportTitle": f"Medical Report #{e.report_id}"} for e in events]

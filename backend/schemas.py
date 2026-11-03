@@ -1,14 +1,32 @@
-from pydantic import BaseModel, EmailStr
+import re
+from pydantic import BaseModel, field_validator
 from typing import Optional, List
 
 class UserCreate(BaseModel):
-    email: EmailStr
+    email: str
     password: str
     role: str  # "patient" or "doctor"
+    full_name: Optional[str] = None
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, value):
+        value = value.strip().lower()
+        if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", value):
+            raise ValueError("Enter a valid email address.")
+        return value
 
 class UserLogin(BaseModel):
-    email: EmailStr
+    email: str
     password: str
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, value):
+        value = value.strip().lower()
+        if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", value):
+            raise ValueError("Enter a valid email address.")
+        return value
 
 class Token(BaseModel):
     access_token: str

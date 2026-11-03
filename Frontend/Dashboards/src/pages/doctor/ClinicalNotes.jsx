@@ -56,7 +56,7 @@ export default function ClinicalNotes() {
                   {patients.data.map((p) => <option key={p.id} value={p.id}>{p.name} ({p.code})</option>)}
                 </select>
               </label>
-              <label className="block text-sm font-semibold">Related report (optional)
+              <label className="block text-sm font-semibold">Related report
                 <select className={sel} value={reportId} disabled={!pid}
                   onChange={(e) => setParams({ patient: pid, ...(e.target.value ? { report: e.target.value } : {}) })}>
                   <option value="">None</option>
@@ -73,7 +73,7 @@ export default function ClinicalNotes() {
 
             {error && <p role="alert" className="mt-3 rounded-lg bg-flag-tint px-3 py-2 text-sm text-flag">{error}</p>}
             {done && <p role="status" className="mt-3 rounded-lg bg-verified-tint px-3 py-2 text-sm text-verified">{done}</p>}
-            <Button type="submit" className="mt-4" disabled={busy || !pid || !text.trim()}>{busy ? "Saving..." : "Save note"}</Button>
+            <Button type="submit" className="mt-4" disabled={busy || !pid || !reportId || !text.trim()}>{busy ? "Saving..." : "Save note"}</Button>
           </form>
         )}
       </Card>

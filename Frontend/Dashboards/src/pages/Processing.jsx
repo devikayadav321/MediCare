@@ -33,7 +33,7 @@ export default function Processing() {
   if (!report) return <Spinner label="Checking your report" />;
 
   const failed = report.status === "failed";
-  const done = report.status === "pending" || report.status === "verified";
+  const done = report.status === "pending" || report.status === "verified" || report.status === "reviewed";
   const stage = done ? PROCESS_STEPS.length - 1 : report.stage;
 
   return (

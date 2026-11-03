@@ -64,6 +64,8 @@ export default function ReportReview() {
         <Notice tone="pending">{DOC_DISCLAIMER}</Notice>
       )}
 
+      {data.report.ai_summary && <div className="mt-4 rounded-xl border border-line bg-white p-4"><h2 className="font-semibold">AI summary</h2><p className="mt-2 whitespace-pre-wrap text-sm leading-relaxed">{data.report.ai_summary}</p></div>}
+
       <div className="mt-6 grid gap-6 lg:grid-cols-2">
         <div>
           <div className="mb-2 flex items-baseline justify-between">
@@ -84,7 +86,7 @@ export default function ReportReview() {
 
         <div className="lg:sticky lg:top-6 lg:self-start">
           <h2 className="mb-2 text-xl font-semibold">Original report</h2>
-          <ReportViewer page={pages.find((p) => p.page === active?.evidence.page) || pages[0]} evidence={active?.evidence} />
+          {pages[0]?.fileUrl && pages[0].fileType?.startsWith("image/") ? <img src={pages[0].fileUrl} alt="Original medical report" className="max-h-[560px] w-full rounded-xl border border-line object-contain bg-white" /> : pages[0]?.fileUrl ? <iframe title="Original medical report" src={pages[0].fileUrl} className="h-[560px] w-full rounded-xl border border-line bg-white" /> : <ReportViewer page={pages.find((p) => p.page === active?.evidence.page) || pages[0]} evidence={active?.evidence} />}
           {active && <p className="mt-2 text-sm text-ink-soft">Source line: <em>{active.evidence.text.replace(/\s+/g, " ")}</em></p>}
         </div>
       </div>

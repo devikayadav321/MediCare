@@ -17,7 +17,7 @@ export default function Sharing() {
   const [done, setDone] = useState("");
   const [revoking, setRevoking] = useState(null);
 
-  const shareable = (reports.data || []).filter((r) => r.status === "pending" || r.status === "verified");
+  const shareable = (reports.data || []).filter((r) => ["pending", "verified", "reviewed"].includes(r.status));
   const titleOf = (id) => reports.data?.find((r) => r.id === id)?.title || "Report";
   const toggle = (id) => setChosen((c) => (c.includes(id) ? c.filter((x) => x !== id) : [...c, id]));
 
